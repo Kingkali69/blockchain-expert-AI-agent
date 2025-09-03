@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""
+Additional Production Components for CertiK-Style Security Agent
+Database integration, caching, metrics, and advanced features
+"""
+
+import asyncio
+import json
+import hashlib
+import time
+from typing import Dict, List, Any, Optional
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import logging
+import aioredis
+import asyncpg
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseManager:
+    """PostgreSQL database integration for persistent storage"""
+    
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self.pool = None
+    
+    async def initialize(self):
+        """Initialize database connection pool"""
+        self.pool = await asyncpg.create_pool(self.connection_string)
+        await self._create_tables()
+        logger.info("Database initialized successfully")
+    
+    async def _create_tables(self):
+        """Create necessary database tables"""
+        async with self.pool.acquire() as conn:
+            # Tasks table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS security_tasks (
+                    id VARCHAR(255) PRIMARY KEY,
+                    name VARCHAR(500) NOT NULL,
+                    task_type VARCHAR(100) NOT NULL,
+                    priority VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    data JSONB NOT NULL,
+                    result JSONB,
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    completed_at TIMESTAMP
+                );
+            ''')
+            
+            # Findings table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS security_findings (
+                    id SERIAL PRIMARY KEY,
+                    task_id VARCHAR(255) REFERENCES security_tasks(id),
+                    severity VARCHAR(20) NOT NULL,
+                    title VARCHAR(500) NOT NULL,
+                    description TEXT NOT NULL,
+                    location VARCHAR(200),
+                    recommendation TEXT,
+                    confidence FLOAT NOT NULL,
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            ''')
+            
+            # Contracts cache table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS contract_cache (
+                    address VARCHAR(42) PRIMARY KEY,
+                    source_code TEXT,
+                    bytecode TEXT,
+                    abi JSONB,
+                    compiler_version VARCHAR(50),
+                    last_updated TIMESTAMP DEFAULT NOW(),
+                    verification_status VARCHAR(20)
+                );
+            ''')
+            
+            # Create indexes
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON security_tasks(status);')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_created ON security_tasks(created_at);')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_findings_severity ON security_findings(severity);')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_findings_task ON security_findings(task_id);')
+    
+    async def save_task(self, task) -> bool:
+        """Save task to database"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO security_tasks (id, name, task_type, priority, status, data, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        result = EXCLUDED.result,
+                        error_message = EXCLUDED.error_message,
+                        updated_at = NOW(),
+                        completed_at = CASE WHEN EXCLUDED.status IN ('completed', 'failed') THEN NOW() ELSE completed_at END
+                ''', task.id, task.name, task.task_type, task.priority.name, 
+                    task.status.value, json.dumps(task.data), task.created_at)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving task to database: {e}")
+            return False
+    
+    async def get_task_history(self, limit: int = 100) -> List[Dict]:
+        """Get task history from database"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT id, name, task_type, status, created_at, completed_at
+                FROM security_tasks 
+                ORDER BY created_at DESC 
+                LIMIT $1
+            ''', limit)
+            return [dict(row) for row in rows]
+    
+    async def get_analytics_data(self) -> Dict[str, Any]:
+        """Get analytics data from database"""
+        async with self.pool.acquire() as conn:
+            # Task statistics
+            task_stats = await conn.fetchrow('''
+                SELECT 
+                    COUNT(*) as total_tasks,
+                    COUNT(*) FILTER (WHERE status = 'completed') as completed_tasks,
+                    COUNT(*) FILTER (WHERE status = 'failed') as failed_tasks,
+                    AVG(EXTRACT(EPOCH FROM (completed_at - created_at))) as avg_duration
+                FROM security_tasks
+                WHERE created_at > NOW() - INTERVAL '30 days'
+            ''')
+            
+            # Findings by severity
+            severity_stats = await conn.fetch('''
+                SELECT severity, COUNT(*) as count
+                FROM security_findings sf
+                JOIN security_tasks st ON sf.task_id = st.id
+                WHERE st.created_at > NOW() - INTERVAL '30 days'
+                GROUP BY severity
+            ''')
+            
+            return {
+                "task_statistics": dict(task_stats) if task_stats else {},
+                "severity_distribution": {row['severity']: row['count'] for row in severity_stats}
+            }
+
+
+class CacheManager:
+    """Redis-based caching for improved performance"""
+    
+    def __init__(self, redis_url: str = "redis://localhost:6379"):
+        self.redis_url = redis_url
+        self.redis = None
+    
+    async def initialize(self):
+        """Initialize Redis connection"""
+        self.redis = await aioredis.from_url(self.redis_url)
+        logger.info("Cache manager initialized successfully")
+    
+    async def get_contract_analysis(self, contract_hash: str) -> Optional[Dict]:
+        """Get cached contract analysis result"""
+        try:
+            cached = await self.redis.get(f"analysis:{contract_hash}")
+            return json.loads(cached) if cached else None
+        except Exception as e:
+            logger.error(f"Error getting cached analysis: {e}")
+            return None
+    
+    async def cache_contract_analysis(self, contract_hash: str, result: Dict, ttl: int = 3600):
+        """Cache contract analysis result"""
+        try:
+            await self.redis.setex(
+                f"analysis:{contract_hash}", 
+                ttl, 
+                json.dumps(result, default=str)
+            )
+        except Exception as e:
+            logger.error(f"Error caching analysis: {e}")
+    
+    async def get_threat_intel(self, address: str) -> Optional[Dict]:
+        """Get cached threat intelligence data"""
+        try:
+            cached = await self.redis.get(f"threat:{address.lower()}")
+            return json.loads(cached) if cached else None
+        except Exception as e:
+            logger.error(f"Error getting cached threat intel: {e}")
+            return None
+    
+    async def cache_threat_intel(self, address: str, data: Dict, ttl: int = 1800):
+        """Cache threat intelligence data"""
+        try:
+            await self.redis.setex(
+                f"threat:{address.lower()}", 
+                ttl, 
+                json.dumps(data, default=str)
+            )
+        except Exception as e:
+            logger.error(f"Error caching threat intel: {e}")
+
+
+class MetricsCollector:
+    """Prometheus metrics collection"""
+    
+    def __init__(self):
+        # Define metrics
+        self.tasks_total = Counter('security_tasks_total', 'Total number of security tasks', ['task_type', 'status'])
+        self.task_duration = Histogram('security_task_duration_seconds', 'Task processing duration')
+        self.findings_total = Counter('security_findings_total', 'Total security findings', ['severity'])
+        self.active_tasks = Gauge('security_active_tasks', 'Number of currently active tasks')
+        self.module_executions = Counter('module_executions_total', 'Module execution count', ['module_name', 'status'])
+        
+        # Start metrics server
+        start_http_server(8001)
+        logger.info("Metrics server started on port 8001")
+    
+    def record_task_submitted(self, task_type: str):
+        """Record task submission"""
+        self.tasks_total.labels(task_type=task_type, status='submitted').inc()
+    
+    def record_task_completed(self, task_type: str, duration: float, findings_count: Dict[str, int]):
+        """Record task completion"""
+        self.tasks_total.labels(task_type=task_type, status='completed').inc()
+        self.task_duration.observe(duration)
+        
+        for severity, count in findings_count.items():
+            self.findings_total.labels(severity=severity).inc(count)
+    
+    def record_task_failed(self, task_type: str):
+        """Record task failure"""
+        self.tasks_total.labels(task_type=task_type, status='failed').inc()
+    
+    def set_active_tasks(self, count: int):
+        """Set number of active tasks"""
+        self.active_tasks.set(count)
+    
+    def record_module_execution(self, module_name: str, success: bool):
+        """Record module execution"""
+        status = 'success' if success else 'failed'
+        self.module_executions.labels(module_name=module_name, status=status).inc()
+
+
+class ContractSourceFetcher:
+    """Fetches smart contract source code from various sources"""
+    
+    def __init__(self, api_keys: Dict[str, str]):
+        self.api_keys = api_keys
+        self.etherscan_api_key = api_keys.get('etherscan')
+        self.polygonscan_api_key = api_keys.get('polygonscan')
+    
+    async def fetch_contract_source(self, address: str, blockchain: str = "ethereum") -> Optional[Dict]:
+        """Fetch contract source code and metadata"""
+        try:
+            if blockchain == "ethereum":
+                return await self._fetch_from_etherscan(address)
+            elif blockchain == "polygon":
+                return await self._fetch_from_polygonscan(address)
+            else:
+                logger.warning(f"Unsupported blockchain: {blockchain}")
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching contract source: {e}")
+            return None
+    
+    async def _fetch_from_etherscan(self, address: str) -> Optional[Dict]:
+        """Fetch from Etherscan API"""
+        import aiohttp
+        
+        if not self.etherscan_api_key:
+            logger.warning("No Etherscan API key provided")
+            return None
+        
+        url = "https://api.etherscan.io/api"
+        params = {
+            "module": "contract",
+            "action": "getsourcecode",
+            "address": address,
+            "apikey": self.etherscan_api_key
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data["status"] == "1" and data["result"]:
+                        result = data["result"][0]
+                        return {
+                            "source_code": result.get("SourceCode", ""),
+                            "abi": result.get("ABI", ""),
+                            "contract_name": result.get("ContractName", ""),
+                            "compiler_version": result.get("CompilerVersion", ""),
+                            "optimization_used": result.get("OptimizationUsed", ""),
+                            "runs": result.get("Runs", ""),
+                            "constructor_arguments": result.get("ConstructorArguments", ""),
+                            "library": result.get("Library", ""),
+                            "license_type": result.get("LicenseType", ""),
+                            "proxy": result.get("Proxy", ""),
+                            "implementation": result.get("Implementation", "")
+                        }
+        return None
+    
+    async def _fetch_from_polygonscan(self, address: str) -> Optional[Dict]:
+        """Fetch from PolygonScan API"""
+        import aiohttp
+        
+        if not self.polygonscan_api_key:
+            logger.warning("No PolygonScan API key provided")
+            return None
+        
+        url = "https://api.polygonscan.com/api"
+        params = {
+            "module": "contract",
+            "action": "getsourcecode", 
+            "address": address,
+            "apikey": self.polygonscan_api_key
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data["status"] == "1" and data["result"]:
+                        result = data["result"][0]
+                        return {
+                            "source_code": result.get("SourceCode", ""),
+                            "abi": result.get("ABI", ""),
+                            "contract_name": result.get("ContractName", ""),
+                            "compiler_version": result.get("CompilerVersion", "")
+                        }
+        return None
+
+
+class WebhookManager:
+    """Manages webhooks for real-time notifications"""
+    
+    def __init__(self, webhook_configs: Dict[str, str]):
+        self.webhooks = webhook_configs
+    
+    async def send_analysis_complete(self, task_id: str, report: Dict[str, Any]):
+        """Send webhook notification when analysis completes"""
+        payload = {
+            "event": "analysis_complete",
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "summary": {
+                "risk_level": report.get("risk_assessment", {}).get("risk_level"),
+                "total_findings": report.get("risk_assessment", {}).get("total_findings", 0),
+                "critical_findings": report.get("risk_assessment", {}).get("severity_distribution", {}).get("critical", 0)
+            }
+        }
+        
+        await self._send_webhook_payload(payload)
+    
+    async def send_high_severity_alert(self, finding: Dict[str, Any]):
+        """Send immediate alert for critical/high severity findings"""
+        if finding.get("severity") in ["critical", "high"]:
+            payload = {
+                "event": "high_severity_finding",
+                "timestamp": datetime.now().isoformat(),
+                "finding": finding
+            }
+            await self._send_webhook_payload(payload)
+    
+    async def _send_webhook_payload(self, payload: Dict[str, Any]):
+        """Send payload to configured webhooks"""
+        import aiohttp
+        
+        for name, url in self.webhooks.items():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            logger.info(f"Webhook {name} sent successfully")
+                        else:
+                            logger.error(f"Webhook {name} failed: {response.status}")
+            except Exception as e:
+                logger.error(f"Error sending webhook {name}: {e}")
+
+
+class RateLimiter:
+    """Rate limiting for API endpoints and external calls"""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    async def check_rate_limit(self, key: str, limit: int, window: int) -> bool:
+        """Check if request is within rate limit"""
+        try:
+            current = await self.redis.incr(key)
+            if current == 1:
+                await self.redis.expire(key, window)
+            return current <= limit
+        except Exception as e:
+            logger.error(f"Rate limit check error: {e}")
+            return True  # Allow on error
+    
+    async def check_api_rate_limit(self, client_ip: str) -> bool:
+        """Check API rate limit (100 requests per hour)"""
+        key = f"api_limit:{client_ip}:{int(time.time() // 3600)}"
+        return await self.check_rate_limit(key, 100, 3600)
+    
+    async def check_analysis_rate_limit(self, user_id: str) -> bool:
+        """Check analysis rate limit (10 analyses per day)"""
+        key = f"analysis_limit:{user_id}:{int(time.time() // 86400)}"
+        return await self.check_rate_limit(key, 10, 86400)
+
+
+class SecurityEnhancedAgent:
+    """Enhanced security agent with production features"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.db_manager = None
+        self.cache_manager = None
+        self.metrics = MetricsCollector()
+        self.source_fetcher = None
+        self.webhook_manager = None
+        self.rate_limiter = None
+        
+        # Initialize components based on config
+        if hasattr(config, 'database_url') and config.database_url:
+            self.db_manager = DatabaseManager(config.database_url)
+        
+        if hasattr(config, 'redis_url') and config.redis_url:
+            self.cache_manager = CacheManager(config.redis_url)
+        
+        if hasattr(config, 'blockchain_api_keys') and config.blockchain_api_keys:
+            self.source_fetcher = ContractSourceFetcher(config.blockchain_api_keys)
+        
+        if hasattr(config, 'webhook_urls') and config.webhook_urls:
+            self.webhook_manager = WebhookManager(config.webhook_urls)
+    
+    async def initialize(self):
+        """Initialize all components"""
+        if self.db_manager:
+            await self.db_manager.initialize()
+        
+        if self.cache_manager:
+            await self.cache_manager.initialize()
+            self.rate_limiter = RateLimiter(self.cache_manager.redis)
+        
+        logger.info("Enhanced security agent initialized")
+    
+    async def analyze_contract_with_caching(self, address: str, blockchain: str = "ethereum") -> Dict[str, Any]:
+        """Analyze contract with caching support"""
+        
+        # Generate cache key
+        contract_hash = hashlib.sha256(f"{blockchain}:{address}".encode()).hexdigest()
+        
+        # Check cache first
+        if self.cache_manager:
+            cached_result = await self.cache_manager.get_contract_analysis(contract_hash)
+            if cached_result:
+                logger.info(f"Using cached analysis for {address}")
+                return cached_result
+        
+        # Fetch contract source if not provided
+        contract_data = None
+        if self.source_fetcher:
+            contract_data = await self.source_fetcher.fetch_contract_source(address, blockchain)
+        
+        if not contract_data or not contract_data.get("source_code"):
+            return {"error": "Could not fetch contract source code"}
+        
+        # Perform analysis (integrate with existing agent)
+        # This would call your existing SecurityAgentCore
+        
+        # Cache result
+        if self.cache_manager:
+            await self.cache_manager.cache_contract_analysis(contract_hash, result)
+        
+        # Send webhooks
+        if self.webhook_manager:
+            await self.webhook_manager.send_analysis_complete(address, resul
