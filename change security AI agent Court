@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+Blockchain Security AI Agent Core
+Inspired by CertiK's approach to automated security auditing
+"""
+
+import asyncio
+import logging
+import json
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Callable
+from dataclasses import dataclass
+from enum import Enum
+import threading
+from pathlib import Path
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class TaskPriority(Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    CRITICAL = 4
+
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class SecurityTask:
+    """Represents a security analysis task"""
+    id: str
+    name: str
+    task_type: str
+    priority: TaskPriority
+    data: Dict[str, Any]
+    created_at: datetime
+    status: TaskStatus = TaskStatus.PENDING
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class Finding:
+    """Represents a security finding"""
+    severity: str  # critical, high, medium, low, info
+    title: str
+    description: str
+    location: Optional[str] = None
+    recommendation: Optional[str] = None
+    confidence: float = 0.0
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class SecurityModule:
+    """Base class for security analysis modules"""
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.logger = logging.getLogger(f"module.{name}")
+    
+    async def analyze(self, task: SecurityTask) -> List[Finding]:
+        """Override this method to implement analysis logic"""
+        raise NotImplementedError
+    
+    def can_handle(self, task: SecurityTask) -> bool:
+        """Check if this module can handle the given task"""
+        return False
+
+
+class SmartContractAnalyzer(SecurityModule):
+    """Smart contract security analyzer"""
+    
+    def __init__(self):
+        super().__init__("smart_contract_analyzer")
+        self.vulnerability_patterns = [
+            "reentrancy",
+            "integer_overflow",
+            "access_control",
+            "unchecked_external_calls",
+            "tx_origin_usage"
+        ]
+    
+    def can_handle(self, task: SecurityTask) -> bool:
+        return task.task_type == "smart_contract_audit"
+    
+    async def analyze(self, task: SecurityTask) -> List[Finding]:
+        """Analyze smart contract for vulnerabilities"""
+        findings = []
+        contract_code = task.data.get("contract_code", "")
+        
+        self.logger.info(f"Analyzing smart contract: {task.name}")
+        
+        # Simulate analysis (replace with actual static analysis logic)
+        await asyncio.sleep(2)  # Simulate processing time
+        
+        # Example vulnerability checks
+        if "call.value" in contract_code:
+            findings.append(Finding(
+                severity="high",
+                title="Potential Reentrancy Vulnerability",
+                description="Usage of call.value() without reentrancy protection",
+                recommendation="Use ReentrancyGuard or checks-effects-interactions pattern",
+                confidence=0.8
+            ))
+        
+        if "tx.origin" in contract_code:
+            findings.append(Finding(
+                severity="medium", 
+                title="tx.origin Usage Detected",
+                description="Using tx.origin for authorization is insecure",
+                recommendation="Use msg.sender instead of tx.origin",
+                confidence=0.9
+            ))
+        
+        self.logger.info(f"Found {len(findings)} potential issues")
+        return findings
+
+
+class BlockchainAnalyzer(SecurityModule):
+    """Blockchain transaction and event analyzer"""
+    
+    def __init__(self):
+        super().__init__("blockchain_analyzer")
+    
+    def can_handle(self, task: SecurityTask) -> bool:
+        return task.task_type == "blockchain_analysis"
+    
+    async def analyze(self, task: SecurityTask) -> List[Finding]:
+        """Analyze blockchain transactions and events"""
+        findings = []
+        
+        self.logger.info(f"Analyzing blockchain data: {task.name}")
+        
+        # Simulate blockchain analysis
+        await asyncio.sleep(1.5)
+        
+        # Example analysis
+        tx_data = task.data.get("transactions", [])
+        if len(tx_data) > 100:
+            findings.append(Finding(
+                severity="info",
+                title="High Transaction Volume",
+                description=f"Detected {len(tx_data)} transactions in analysis window",
+                confidence=1.0
+            ))
+        
+        return findings
+
+
+class ReportGenerator:
+    """Generates security audit reports"""
+    
+    @staticmethod
+    def generate_report(task: SecurityTask, findings: List[Finding]) -> Dict[str, Any]:
+        """Generate a structured security report"""
+        severity_counts = {}
+        for finding in findings:
+            severity_counts[finding.severity] = severity_counts.get(finding.severity, 0) + 1
+        
+        report = {
+            "task_id": task.id,
+            "task_name": task.name,
+            "analysis_type": task.task_type,
+            "timestamp": datetime.now().isoformat(),
+            "summary": {
+                "total_findings": len(findings),
+                "severity_breakdown": severity_counts,
+                "risk_score": ReportGenerator._calculate_risk_score(findings)
+            },
+            "findings": [
+                {
+                    "severity": f.severity,
+                    "title": f.title,
+                    "description": f.description,
+                    "location": f.location,
+                    "recommendation": f.recommendation,
+                    "confidence": f.confidence,
+                    "metadata": f.metadata
+                }
+                for f in findings
+            ]
+        }
+        
+        return report
+    
+    @staticmethod
+    def _calculate_risk_score(findings: List[Finding]) -> float:
+        """Calculate overall risk score based on findings"""
+        severity_weights = {
+            "critical": 10,
+            "high": 7,
+            "medium": 4,
+            "low": 2,
+            "info": 0.5
+        }
+        
+        total_score = sum(
+            severity_weights.get(f.severity, 0) * f.confidence
+            for f in findings
+        )
+        
+        return min(total_score, 100.0)
+
+
+class SecurityAgentCore:
+    """Main orchestrator for the security agent"""
+    
+    def __init__(self):
+        self.modules: List[SecurityModule] = []
+        self.task_queue: List[SecurityTask] = []
+        self.running_tasks: Dict[str, SecurityTask] = {}
+        self.completed_tasks: Dict[str, SecurityTask] = {}
+        self.is_running = False
+        self.max_concurrent_tasks = 5
+        
+        # Initialize default modules
+        self._initialize_modules()
+        
+        logger.info("Security Agent Core initialized")
+    
+    def _initialize_modules(self):
+        """Initialize security analysis modules"""
+        self.modules = [
+            SmartContractAnalyzer(),
+            BlockchainAnalyzer()
+        ]
+        logger.info(f"Loaded {len(self.modules)} analysis modules")
+    
+    def register_module(self, module: SecurityModule):
+        """Register a new security module"""
+        self.modules.append(module)
+        logger.info(f"Registered module: {module.name}")
+    
+    def submit_task(self, task: SecurityTask) -> str:
+        """Submit a new security analysis task"""
+        self.task_queue.append(task)
+        self.task_queue.sort(key=lambda t: t.priority.value, reverse=True)
+        logger.info(f"Submitted task: {task.name} (Priority: {task.priority.name})")
+        return task.id
+    
+    async def process_task(self, task: SecurityTask) -> Dict[str, Any]:
+        """Process a single security task"""
+        task.status = TaskStatus.RUNNING
+        self.running_tasks[task.id] = task
+        
+        try:
+            # Find appropriate module
+            handler = None
+            for module in self.modules:
+                if module.can_handle(task):
+                    handler = module
+                    break
+            
+            if not handler:
+                raise ValueError(f"No handler found for task type: {task.task_type}")
+            
+            logger.info(f"Processing task {task.name} with {handler.name}")
+            
+            # Run analysis
+            findings = await handler.analyze(task)
+            
+            # Generate report
+            report = ReportGenerator.generate_report(task, findings)
+            
+            task.status = TaskStatus.COMPLETED
+            task.result = report
+            
+            # Move to completed tasks
+            self.completed_tasks[task.id] = task
+            if task.id in self.running_tasks:
+                del self.running_tasks[task.id]
+            
+            logger.info(f"Completed task: {task.name} ({len(findings)} findings)")
+            return report
+            
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            logger.error(f"Task failed: {task.name} - {e}")
+            
+            if task.id in self.running_tasks:
+                del self.running_tasks[task.id]
+            
+            raise
+    
+    async def run(self):
+        """Main execution loop"""
+        self.is_running = True
+        logger.info("Security Agent Core started")
+        
+        while self.is_running:
+            try:
+                # Process pending tasks (up to max concurrent)
+                available_slots = self.max_concurrent_tasks - len(self.running_tasks)
+                
+                for _ in range(min(available_slots, len(self.task_queue))):
+                    if not self.task_queue:
+                        break
+                    
+                    task = self.task_queue.pop(0)
+                    
+                    # Process task asynchronously
+                    asyncio.create_task(self.process_task(task))
+                
+                await asyncio.sleep(1)  # Check every second
+                
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
+    
+    def stop(self):
+        """Stop the agent"""
+        self.is_running = False
+        logger.info("Security Agent Core stopped")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current agent status"""
+        return {
+            "is_running": self.is_running,
+            "queued_tasks": len(self.task_queue),
+            "running_tasks": len(self.running_tasks),
+            "completed_tasks": len(self.completed_tasks),
+            "modules_loaded": len(self.modules)
+        }
+
+
+# Example usage and CLI interface
+class SecurityAgentCLI:
+    """Command-line interface for the security agent"""
+    
+    def __init__(self):
+        self.agent = SecurityAgentCore()
+        self.commands = {
+            "status": self.show_status,
+            "submit": self.submit_analysis,
+            "list": self.list_tasks,
+            "report": self.show_report,
+            "help": self.show_help
+        }
+    
+    def show_status(self, args: List[str]):
+        """Show agent status"""
+        status = self.agent.get_status()
+        print("\n=== Security Agent Status ===")
+        for key, value in status.items():
+            print(f"{key}: {value}")
+    
+    def submit_analysis(self, args: List[str]):
+        """Submit a new analysis task"""
+        if len(args) < 2:
+            print("Usage: submit <type> <name> [data_file]")
+            return
+        
+        task_type = args[0]
+        task_name = args[1]
+        
+        # Create sample task data
+        data = {}
+        if len(args) > 2:
+            try:
+                with open(args[2], 'r') as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"Error loading data file: {e}")
+                return
+        
+        task = SecurityTask(
+            id=f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=task_name,
+            task_type=task_type,
+            priority=TaskPriority.MEDIUM,
+            data=data,
+            created_at=datetime.now()
+        )
+        
+        task_id = self.agent.submit_task(task)
+        print(f"Submitted task: {task_id}")
+    
+    def list_tasks(self, args: List[str]):
+        """List all tasks"""
+        print("\n=== Tasks ===")
+        
+        print("\nQueued:")
+        for task in self.agent.task_queue:
+            print(f"  {task.id}: {task.name} ({task.status.value})")
+        
+        print("\nRunning:")
+        for task in self.agent.running_tasks.values():
+            print(f"  {task.id}: {task.name} ({task.status.value})")
+        
+        print("\nCompleted:")
+        for task in list(self.agent.completed_tasks.values())[-5:]:  # Show last 5
+            print(f"  {task.id}: {task.name} ({task.status.value})")
+    
+    def show_report(self, args: List[str]):
+        """Show task report"""
+        if len(args) < 1:
+            print("Usage: report <task_id>")
+            return
+        
+        task_id = args[0]
+        task = self.agent.completed_tasks.get(task_id)
+        
+        if not task or not task.result:
+            print(f"No report found for task: {task_id}")
+            return
+        
+        report = task.result
+        print(f"\n=== Security Report: {task.name} ===")
+        print(f"Risk Score: {report['summary']['risk_score']:.1f}/100")
+        print(f"Total Findings: {report['summary']['total_findings']}")
+        
+        for finding in report['findings']:
+            print(f"\n[{finding['severity'].upper()}] {finding['title']}")
+            print(f"  Description: {finding['description']}")
+            if finding['recommendation']:
+                print(f"  Recommendation: {finding['recommendation']}")
+    
+    def show_help(self, args: List[str]):
+        """Show help"""
+        print("\n=== Available Commands ===")
+        print("status          - Show agent status")
+        print("submit <type> <name> [data_file] - Submit analysis task")
+        print("list            - List all tasks")
+        print("report <task_id> - Show task report")
+        print("help            - Show this help")
+        print("quit/exit       - Exit the CLI")
+    
+    def run(self):
+        """Run the CLI"""
+        print("Security Agent CLI - Type 'help' for commands")
+        
+        # Start agent in background
+        agent_task = asyncio.create_task(self.agent.run())
+        
+        try:
+            while True:
+                try:
+                    command_input = input("\nsec-agent> ").strip()
+                    if command_input.lower() in ['quit', 'exit']:
+                        break
+                    
+                    if not command_input:
+                        continue
+                    
+                    parts = command_input.split()
+                    command = parts[0]
+                    args = parts[1:]
+                    
+                    if command in self.commands:
+                        self.commands[command](args)
+                    else:
+                        print(f"Unknown command: {command}")
+                        self.show_help([])
+                        
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print(f"Error: {e}")
+        
+        finally:
+            self.agent.stop()
+            agent_task.cancel()
+            print("\nGoodbye!")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        # Run CLI interface
+        cli = SecurityAgentCLI()
+        asyncio.run(cli.run())
+    else:
+        # Example usage
+        async def example_usage():
+            agent = SecurityAgentCore()
+            
+            # Submit a smart contract analysis task
+            task = SecurityTask(
+                id="example_001",
+                name="Sample Contract Audit",
+                task_type="smart_contract_audit",
+                priority=TaskPriority.HIGH,
+                data={
+                    "contract_code": '''
+                    pragma solidity ^0.8.0;
+                    
+                    contract VulnerableContract {
+                        mapping(address => uint) public balances;
+                        
+                        function withdraw(uint amount) public {
+                            require(balances[msg.sender] >= amount);
+                            (bool success, ) = msg.sender.call{value: amount}("");
+                            require(success);
+                            balances[msg.sender] -= amount; // Vulnerable to reentrancy
+                        }
+                        
+                        function authorize(address user) public {
+                            require(tx.origin == owner); // Insecure authorization
+                        }
+                    }
+                    '''
+                },
+                created_at=datetime.now()
+            )
+            
+            # Start the agent
+            agent_task = asyncio.create_task(agent.run())
+            
+            # Submit and process task
+            task_id = agent.submit_task(task)
+            
+            # Wait for completion
+            await asyncio.sleep(5)
+            
+            # Show results
+            if task_id in agent.completed_tasks:
+                report = agent.completed_tasks[task_id].result
+                print("\n=== Analysis Complete ===")
+                print(json.dumps(report, indent=2))
+            
+            agent.stop()
+        
+        asyncio.run(example_usage())
