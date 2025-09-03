@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""
+Configuration and Deployment Module for Blockchain Security AI Agent
+Handles configuration, API endpoints, and deployment scenarios
+"""
+
+import os
+import json
+import yaml
+import asyncio
+import aiohttp
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import logging
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import uvicorn
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentConfiguration:
+    """Configuration settings for the security agent"""
+    
+    # Core settings
+    agent_name: str = "CertiK-AI-Agent"
+    version: str = "1.0.0"
+    max_concurrent_tasks: int = 5
+    task_timeout_seconds: int = 300
+    
+    # Module settings
+    enabled_modules: List[str] = None
+    module_config: Dict[str, Any] = None
+    
+    # API settings
+    api_enabled: bool = False
+    api_host: str = "localhost"
+    api_port: int = 8000
+    api_key: Optional[str] = None
+    
+    # Storage settings
+    report_output_dir: str = "audit_reports"
+    log_output_dir: str = "logs"
+    
+    # External services
+    blockchain_rpc_urls: Dict[str, str] = None
+    threat_intel_api_keys: Dict[str, str] = None
+    
+    # Notification settings
+    slack_webhook: Optional[str] = None
+    email_notifications: Dict[str, str] = None
+    
+    def __post_init__(self):
+        if self.enabled_modules is None:
+            self.enabled_modules = [
+                "static_code_analyzer",
+                "smart_contract_analyzer", 
+                "threat_intelligence",
+                "compliance_checker",
+                "gas_analyzer",
+                "business_logic_analyzer"
+            ]
+        
+        if self.module_config is None:
+            self.module_config = {}
+        
+        if self.blockchain_rpc_urls is None:
+            self.blockchain_rpc_urls = {
+                "ethereum": "https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY",
+                "polygon": "https://polygon-mainnet.alchemyapi.io/v2/YOUR_KEY",
+                "bsc": "https://bsc-dataseed.binance.org/"
+            }
+        
+        if self.threat_intel_api_keys is None:
+            self.threat_intel_api_keys = {}
+        
+        if self.email_notifications is None:
+            self.email_notifications = {}
+
+
+class ConfigurationManager:
+    """Manages agent configuration loading and saving"""
+    
+    def __init__(self, config_path: str = "agent_config.yaml"):
+        self.config_path = Path(config_path)
+        self.config = AgentConfiguration()
+    
+    def load_config(self) -> AgentConfiguration:
+        """Load configuration from file"""
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    if self.config_path.suffix.lower() == '.yaml':
+                        config_data = yaml.safe_load(f)
+                    else:
+                        config_data = json.load(f)
+                
+                # Update configuration with loaded data
+                for key, value in config_data.items():
+                    if hasattr(self.config, key):
+                        setattr(self.config, key, value)
+                
+                logger.info(f"Configuration loaded from {self.config_path}")
+                
+            except Exception as e:
+                logger.error(f"Error loading configuration: {e}")
+                logger.info("Using default configuration")
+        
+        return self.config
+    
+    def save_config(self, config: Optional[AgentConfiguration] = None) -> None:
+        """Save configuration to file"""
+        if config:
+            self.config = config
+        
+        try:
+            config_data = asdict(self.config)
+            
+            with open(self.config_path, 'w') as f:
+                if self.config_path.suffix.lower() == '.yaml':
+                    yaml.dump(config_data, f, default_flow_style=False, indent=2)
+                else:
+                    json.dump(config_data, f, indent=2)
+            
+            logger.info(f"Configuration saved to {self.config_path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving configuration: {e}")
+
+
+# Pydantic models for API
+class AnalysisRequest(BaseModel):
+    name: str
+    task_type: str
+    priority: str = "medium"
+    contract_code: Optional[str] = None
+    contract_address: Optional[str] = None
+    blockchain: str = "ethereum"
+    additional_data: Dict[str, Any] = {}
+
+
+class AnalysisResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    progress: float
+    findings_count: int = 0
+    estimated_completion: Optional[str] = None
+
+
+class SecurityAgentAPI:
+    """REST API interface for the security agent"""
+    
+    def __init__(self, agent_core, config: AgentConfiguration):
+        self.agent = agent_core
+        self.config = config
+        self.app = FastAPI(
+            title="Blockchain Security AI Agent API",
+            description="CertiK-style automated security auditing API",
+            version=config.version
+        )
+        
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        """Setup API routes"""
+        
+        @self.app.get("/")
+        async def root():
+            return {
+                "agent": self.config.agent_name,
+                "version": self.config.version,
+                "status": "running",
+                "modules": self.config.enabled_modules
+            }
+        
+        @self.app.get("/health")
+        async def health_check():
+            return {
+                "status": "healthy",
+                "timestamp": datetime.now().isoformat(),
+                "agent_status": self.agent.get_status()
+            }
+        
+        @self.app.post("/analyze", response_model=AnalysisResponse)
+        async def submit_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks):
+            """Submit a new security analysis task"""
+            try:
+                from security_agent_core import SecurityTask, TaskPriority
+                
+                # Convert priority string to enum
+                priority_map = {
+                    "low": TaskPriority.LOW,
+                    "medium": TaskPriority.MEDIUM,
+                    "high": TaskPriority.HIGH,
+                    "critical": TaskPriority.CRITICAL
+                }
+                
+                priority = priority_map.get(request.priority.lower(), TaskPriority.MEDIUM)
+                
+                # Prepare task data
+                task_data = {
+                    "contract_code": request.contract_code,
+                    "contract_address": request.contract_address,
+                    "blockchain": request.blockchain,
+                    **request.additional_data
+                }
+                
+                task = SecurityTask(
+                    id=f"api_task_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+                    name=request.name,
+                    task_type=request.task_type,
+                    priority=priority,
+                    data=task_data,
+                    created_at=datetime.now()
+                )
+                
+                task_id = self.agent.submit_task(task)
+                
+                return AnalysisResponse(
+                    task_id=task_id,
+                    status="submitted",
+                    message="Analysis task submitted successfully"
+                )
+                
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.get("/task/{task_id}/status", response_model=TaskStatusResponse)
+        async def get_task_status(task_id: str):
+            """Get status of a specific task"""
+            
+            # Check running tasks
+            if task_id in self.agent.running_tasks:
+                task = self.agent.running_tasks[task_id]
+                return TaskStatusResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    progress=0.5,  # Estimate
+                    estimated_completion="2-5 minutes"
+                )
+            
+            # Check completed tasks
+            if task_id in self.agent.completed_tasks:
+                task = self.agent.completed_tasks[task_id]
+                findings_count = 0
+                if task.result and 'summary' in task.result:
+                    findings_count = task.result['summary'].get('total_findings', 0)
+                
+                return TaskStatusResponse(
+                    task_id=task_id,
+                    status=task.status.value,
+                    progress=1.0,
+                    findings_count=findings_count
+                )
+            
+            # Check queued tasks
+            for task in self.agent.task_queue:
+                if task.id == task_id:
+                    return TaskStatusResponse(
+                        task_id=task_id,
+                        status=task.status.value,
+                        progress=0.0,
+                        estimated_completion="Waiting in queue"
+                    )
+            
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        @self.app.get("/task/{task_id}/report")
+        async def get_task_report(task_id: str):
+            """Get the full report for a completed task"""
+            
+            if task_id not in self.agent.completed_tasks:
+                raise HTTPException(status_code=404, detail="Task not found or not completed")
+            
+            task = self.agent.completed_tasks[task_id]
+            if not task.result:
+                raise HTTPException(status_code=404, detail="Report not available")
+            
+            return task.result
+        
+        @self.app.get("/tasks")
+        async def list_tasks():
+            """List all tasks"""
+            tasks = []
+            
+            # Add queued tasks
+            for task in self.agent.task_queue:
+                tasks.append({
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status.value,
+                    "priority": task.priority.name,
+                    "created_at": task.created_at.isoformat()
+                })
+            
+            # Add running tasks
+            for task in self.agent.running_tasks.values():
+                tasks.append({
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status.value,
+                    "priority": task.priority.name,
+                    "created_at": task.created_at.isoformat()
+                })
+            
+            # Add completed tasks (last 20)
+            completed = list(self.agent.completed_tasks.values())[-20:]
+            for task in completed:
+                tasks.append({
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status.value,
+                    "priority": task.priority.name,
+                    "created_at": task.created_at.isoformat(),
+                    "findings": task.result.get('summary', {}).get('total_findings', 0) if task.result else 0
+                })
+            
+            return {"tasks": tasks, "total": len(tasks)}
+        
+        @self.app.delete("/task/{task_id}")
+        async def cancel_task(task_id: str):
+            """Cancel a running or queued task"""
+            
+            # Cancel running task
+            if task_id in self.agent.running_tasks:
+                task = self.agent.running_tasks[task_id]
+                task.status = "cancelled"
+                del self.agent.running_tasks[task_id]
+                return {"message": f"Task {task_id} cancelled"}
+            
+            # Remove from queue
+            for i, task in enumerate(self.agent.task_queue):
+                if task.id == task_id:
+                    self.agent.task_queue.pop(i)
+                    return {"message": f"Task {task_id} removed from queue"}
+            
+            raise HTTPException(status_code=404, detail="Task not found or already completed")
+        
+        @self.app.get("/metrics")
+        async def get_metrics():
+            """Get system metrics"""
+            return {
+                "queued_tasks": len(self.agent.task_queue),
+                "running_tasks": len(self.agent.running_tasks),
+                "completed_tasks": len(self.agent.completed_tasks),
+                "enabled_modules": self.config.enabled_modules,
+                "uptime": datetime.now().isoformat()
+            }
+
+
+class DeploymentManager:
+    """Manages deployment configurations and scripts"""
+    
+    def __init__(self, config: AgentConfiguration):
+        self.config = config
+    
+    def generate_docker_files(self, output_dir: str = "docker"):
+        """Generate Docker deployment files"""
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        
+        # Dockerfile
+        dockerfile_content = """FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \\
+    gcc \\
+    g++ \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create directories
+RUN mkdir -p audit_reports logs
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \\
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the application
+CMD ["python", "main.py", "--api", "--host", "0.0.0.0"]
+"""
+        
+        with open(output_path / "Dockerfile", 'w') as f:
+            f.write(dockerfile_content)
+        
+        # Docker Compose
+        compose_content = f"""version: '3.8'
+
+services:
+  security-agent:
+    build: .
+    ports:
+      - "{self.config.api_port}:{self.config.api_port}"
+    environment:
+      - AGENT_CONFIG_PATH=/app/config/agent_config.yaml
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./config:/app/config:ro
+      - ./audit_reports:/app/audit_reports
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{self.config.api_port}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+"""
+        
+        with open(output_path / "docker-compose.yml", 'w') as f:
+            f.write(compose_content)
+        
+        # Requirements file
+        requirements_content = """fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+aiohttp==3.9.1
+pyyaml==6.0.1
+requests==2.31.0
+asyncio-mqtt==0.16.1
+python-multipart==0.0.6
+"""
+        
+        with open(output_path / "requirements.txt", 'w') as f:
+            f.write(requirements_content)
+        
+        logger.info(f"Docker files generated in {output_path}")
+    
+    def generate_kubernetes_files(self, output_dir: str = "k8s"):
+        """Generate Kubernetes deployment files"""
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        
+        # Deployment
+        deployment_content = f"""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-agent
+  labels:
+    app: security-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: security-agent
+  template:
+    metadata:
+      labels:
+        app: security-agent
+    spec:
+      containers:
+      - name: security-agent
+        image: security-agent:latest
+        ports:
+        - containerPort: {self.config.api_port}
+        env:
+        - name: AGENT_CONFIG_PATH
+          value: "/app/config/agent_config.yaml"
+        - name: LOG_LEVEL
+          value: "INFO"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: {self.config.api_port}
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {self.config.api_port}
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: reports-volume
+          mountPath: /app/audit_reports
+        - name: logs-volume
+          mountPath: /app/logs
+      volumes:
+      - name: config-volume
+        configMap:
+          name: security-agent-config
+      - name: reports-volume
+        persistentVolumeClaim:
+          claimName: reports-pvc
+      - name: logs-volume
+        persistentVolumeClaim:
+          claimName: logs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-agent-service
+spec:
+  selector:
+    app: security-agent
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: {self.config.api_port}
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-agent-config
+data:
+  agent_config.yaml: |
+    agent_name: "{self.config.agent_name}"
+    version: "{self.config.version}"
+    max_concurrent_tasks: {self.config.max_concurrent_tasks}
+    api_enabled: true
+    api_host: "0.0.0.0"
+    api_port: {self.config.api_port}
+    enabled_modules:
+{chr(10).join([f'      - "{module}"' for module in self.config.enabled_modules])}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reports-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: logs-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+"""
+        
+        with open(output_path / "deployment.yaml", 'w') as f:
+            f.write(deployment_content)
+        
+        logger.info(f"Kubernetes files generated in {output_path}")
+    
+    def generate_systemd_service(self, output_dir: str = "systemd"):
+        """Generate systemd service file for Linux deployment"""
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+        
+        service_content = f"""[Unit]
+Description=Blockchain Security AI Agent
+After=network.target
+
+[Service]
+Type=simple
+User=security-agent
+Group=security-agent
+WorkingDirectory=/opt/security-agent
+Environment=PYTHONPATH=/opt/security-agent
+Environment=AGENT_CONFIG_PATH=/etc/security-agent/agent_config.yaml
+ExecStart=/opt/security-agent/venv/bin/python main.py --api --host 0.0.0.0 --port {self.config.api_port}
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/security-agent /var/lib/security-agent
+
+[Install]
+WantedBy=multi-user.target
+"""
+        
+        with open(output_path / "security-agent.service", 'w') as f:
+            f.write(service_content)
+        
+        # Installation script
+        install_script = f"""#!/bin/bash
+set -e
+
+echo "Installing Blockchain Security AI Agent..."
+
+# Create user and group
+sudo useradd -r -s /bin/false security-agent || true
+
+# Create directories
+sudo mkdir -p /opt/security-agent
+sudo mkdir -p /etc/security-agent
+sudo mkdir -p /var/log/security-agent
+sudo mkdir -p /var/lib/security-agent
+
+# Copy files
+sudo cp -r . /opt/security-agent/
+sudo chown -R security-agent:security-agent /opt/security-agent
+sudo chown -R security-agent:security-agent /var/log/security-agent
+sudo chown -R security-agent:security-agent /var/lib/security-agent
+
+# Install Python dependencies
+cd /opt/security-agent
+sudo -u security-agent python3 -m venv venv
+sudo -u security-agent ./venv/
