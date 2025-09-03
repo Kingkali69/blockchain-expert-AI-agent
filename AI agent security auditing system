@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+CertiK-Style Blockchain Security AI Agent - Main Application
+Complete automated security auditing system for smart contracts and blockchain applications
+"""
+
+import asyncio
+import sys
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, Any
+import json
+
+# Import our modules
+from security_agent_core import SecurityAgentCore, SecurityTask, TaskPriority, SecurityAgentCLI
+from security_modules import (
+    StaticCodeAnalyzer, ThreatIntelligenceModule, ComplianceChecker, 
+    GasAnalyzer, BusinessLogicAnalyzer, AuditReportManager
+)
+from agent_config_deploy import MainApplication, ConfigurationManager
+
+
+def setup_logging():
+    """Setup comprehensive logging"""
+    
+    # Create logs directory
+    Path("logs").mkdir(exist_ok=True)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/agent.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Suppress some verbose libraries
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('aiohttp').setLevel(logging.WARNING)
+
+
+async def run_example_analysis():
+    """Run a comprehensive example analysis"""
+    print("🔍 Running Example Blockchain Security Analysis")
+    print("=" * 60)
+    
+    # Sample vulnerable DeFi contract for demonstration
+    vulnerable_contract = '''
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract VulnerableDeFiVault {
+    mapping(address => uint256) public balances;
+    mapping(address => bool) public authorized;
+    IERC20 public token;
+    address public owner;
+    uint256 public totalDeposits;
+    
+    modifier onlyOwner() {
+        require(tx.origin == owner, "Not owner"); // Vulnerable: tx.origin usage
+        _;
+    }
+    
+    modifier onlyAuthorized() {
+        require(authorized[msg.sender], "Not authorized");
+        _;
+    }
+    
+    constructor(address _token) {
+        token = IERC20(_token);
+        owner = msg.sender;
+    }
+    
+    // Vulnerable: Missing reentrancy protection
+    function deposit(uint256 amount) external {
+        require(amount > 0, "Amount must be positive");
+        
+        token.transferFrom(msg.sender, address(this), amount);
+        balances[msg.sender] += amount;
+        totalDeposits += amount;
+        
+        // Gas inefficient: storage read in loop condition
+        for(uint i = 0; i < authorized.length; i++) {
+            // Some logic here
+        }
+    }
+    
+    // Vulnerable: Reentrancy attack vector
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        
+        // State change after external call - VULNERABLE!
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+        balances[msg.sender] -= amount; // This should be BEFORE the external call
+        totalDeposits -= amount;
+    }
+    
+    // Missing access control
+    function setAuthorized(address user, bool status) external {
+        authorized[user] = status; // Anyone can call this!
+    }
+    
+    // Dangerous admin function without timelock
+    function emergencyWithdraw() external onlyOwner {
+        selfdestruct(payable(owner)); // Unprotected selfdestruct
+    }
+    
+    // Weak randomness
+    function getRandomReward() external view returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(block.timestamp, block.difficulty))) % 1000;
+    }
+    
+    // Gas inefficient public function that could be external
+    function getBalance(address user) public view returns (uint256) {
+        return balances[user];
+    }
+    
+    // Flash loan without proper validation
+    function flashLoan(uint256 amount, address recipient) external {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        
+        token.transfer(recipient, amount);
+        
+        // Callback to recipient
+        IFlashLoanReceiver(recipient).executeOperation(amount);
+        
+        // Only checks balance, not considering other attack vectors
+        require(token.balanceOf(address(this)) >= balanceBefore, "Flash loan not repaid");
+    }
+}
+
+interface IFlashLoanReceiver {
+    function executeOperation(uint256 amount) external;
+}
+'''
+    
+    # Initialize the security agent
+    agent = SecurityAgentCore()
+    
+    # Register all analysis modules
+    modules = [
+        StaticCodeAnalyzer(),
+        ThreatIntelligenceModule(),
+        ComplianceChecker(), 
+        GasAnalyzer(),
+        BusinessLogicAnalyzer()
+    ]
+    
+    for module in modules:
+        agent.register_module(module)
+    
+    print(f"✅ Initialized agent with {len(modules)} analysis modules")
+    
+    # Create analysis task
+    task = SecurityTask(
+        id="demo_comprehensive_audit",
+        name="Vulnerable DeFi Vault Audit", 
+        task_type="comprehensive_audit",
+        priority=TaskPriority.CRITICAL,
+        data={
+            "contract_code": vulnerable_contract,
+            "contract_type": "DeFi Vault",
+            "contract_address": "0x1234567890123456789012345678901234567890",
+            "addresses": [
+                "0x1234567890123456789012345678901234567890",  # Known bad address
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            ],
+            "business_logic": "defi_vault_with_flash_loans"
+        },
+        created_at=asyncio.get_event_loop().time()
+    )
+    
+    # Submit task
+    task_id = agent.submit_task(task)
+    print(f"📝 Submitted analysis task: {task_id}")
+    
+    # Start agent processing
+    agent_task = asyncio.create_task(agent.run())
+    
+    # Wait for analysis to complete
+    print("🔄 Analysis in progress...")
+    await asyncio.sleep(8)  # Give time for analysis
+    
+    # Check results
+    if task_id in agent.completed_tasks:
+        completed_task = agent.completed_tasks[task_id]
+        
+        if completed_task.result:
+            report = completed_task.result
+            
+            print("\n" + "=" * 60)
+            print("🎯 SECURITY AUDIT RESULTS")
+            print("=" * 60)
+            
+            # Summary
+            summary = report.get('summary', {})
+            print(f"📊 Total Findings: {summary.get('total_findings', 0)}")
+            print(f"🎯 Risk Score: {summary.get('risk_score', 0):.1f}/100")
+            
+            severity_breakdown = summary.get('severity_breakdown', {})
+            for severity, count in severity_breakdown.items():
+                if count > 0:
+                    emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}.get(severity, "⚫")
+                    print(f"{emoji} {severity.title()}: {count}")
+            
+            # Detailed findings
+            print(f"\n📋 DETAILED FINDINGS:")
+            print("-" * 40)
+            
+            findings = report.get('findings', [])
+            for i, finding in enumerate(findings[:10], 1):  # Show top 10
+                severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}.get(finding['severity'], "⚫")
+                
+                print(f"\n{i}. {severity_emoji} [{finding['severity'].upper()}] {finding['title']}")
+                print(f"   📍 Location: {finding.get('location', 'N/A')}")
+                print(f"   📝 Description: {finding['description']}")
+                if finding.get('recommendation'):
+                    print(f"   💡 Recommendation: {finding['recommendation']}")
+                print(f"   🎯 Confidence: {finding.get('confidence', 0):.1f}")
+            
+            if len(findings) > 10:
+                print(f"\n... and {len(findings) - 10} more findings")
+            
+            # Save comprehensive report
+            report_manager = AuditReportManager()
+            report_path = report_manager.save_report(report, f"demo_audit_report.json")
+            print(f"\n💾 Full report saved to: {report_path}")
+            
+        else:
+            print("❌ Analysis completed but no report generated")
+    else:
+        print("⏳ Analysis still in progress or failed")
+        print(f"Queue: {len(agent.task_queue)}, Running: {len(agent.running_tasks)}, Completed: {len(agent.completed_tasks)}")
+    
+    # Stop the agent
+    agent.stop()
+    agent_task.cancel()
+    
+    print("\n✅ Example analysis completed!")
+
+
+async def run_interactive_mode():
+    """Run interactive CLI mode"""
+    print("🤖 Starting CertiK-Style Security Agent Interactive Mode")
+    print("Type 'help' for available commands")
+    
+    cli = SecurityAgentCLI()
+    await cli.run()
+
+
+def print_banner():
+    """Print application banner"""
+    banner = """
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                                                               ║
+    ║           🛡️  CertiK-Style AI Security Agent 🛡️              ║
+    ║                                                               ║
+    ║     Automated Blockchain Security Auditing System            ║
+    ║     Smart Contract Analysis • DeFi Protocol Review           ║
+    ║     Compliance Checking • Threat Intelligence                ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+def create_sample_config():
+    """Create a sample configuration file"""
+    config_manager = ConfigurationManager("sample_config.yaml")
+    
+    # Customize config for demo
+    config = config_manager.config
+    config.agent_name = "CertiK-AI-Demo"
+    config.max_concurrent_tasks = 3
+    config.api_enabled = True
+    config.api_port = 8080
+    
+    config_manager.save_config(config)
+    print("📄 Sample configuration saved to: sample_config.yaml")
+
+
+async def main():
+    """Main entry point with comprehensive options"""
+    parser = argparse.ArgumentParser(
+        description="CertiK-Style Blockchain Security AI Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --demo                    # Run example security analysis
+  python main.py --interactive             # Start interactive CLI mode  
+  python main.py --api                     # Start REST API server
+  python main.py --config myconfig.yaml   # Use custom configuration
+  python main.py --generate-config        # Generate sample configuration
+  python main.py --generate-docker        # Generate Docker files
+  python main.py --generate-k8s           # Generate Kubernetes files
+        """
+    )
+    
+    # Mode selection
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--demo", action="store_true",
+                           help="Run comprehensive example analysis")
+    mode_group.add_argument("--interactive", "--cli", action="store_true",
+                           help="Start interactive CLI mode")
+    mode_group.add_argument("--api", action="store_true", 
+                           help="Start REST API server")
+    mode_group.add_argument("--standalone", action="store_true",
+                           help="Run in standalone mode")
+    
+    # Configuration options
+    parser.add_argument("--config", default="agent_config.yaml",
+                       help="Configuration file path")
+    parser.add_argument("--generate-config", action="store_true",
+                       help="Generate sample configuration file")
+    
+    # Deployment options
+    deploy_group = parser.add_mutually_exclusive_group()
+    deploy_group.add_argument("--generate-docker", action="store_true",
+                             help="Generate Docker deployment files")
+    deploy_group.add_argument("--generate-k8s", action="store_true", 
+                             help="Generate Kubernetes deployment files")
+    
+    # Utility options
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                       default="INFO", help="Set logging level")
+    parser.add_argument("--version", action="version", version="CertiK-AI-Agent 1.0.0")
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging()
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    
+    # Print banner
+    print_banner()
+    
+    try:
+        # Handle generation commands first
+        if args.generate_config:
+            create_sample_config()
+            return
+        
+        if args.generate_docker or args.generate_k8s:
+            from agent_config_deploy import DeploymentManager, AgentConfiguration
+            config = AgentConfiguration()
+            deployment_manager = DeploymentManager(config)
+            
+            if args.generate_docker:
+                deployment_manager.deploy_docker()
+                print("🐳 Docker deployment files generated successfully!")
+            
+            if args.generate_k8s:
+                deployment_manager.deploy_kubernetes() 
+                print("☸️ Kubernetes deployment files generated successfully!")
+            
+            return
+        
+        # Handle run modes
+        if args.demo:
+            await run_example_analysis()
+        
+        elif args.interactive:
+            await run_interactive_mode()
+        
+        elif args.api:
+            app = MainApplication(args.config)
+            await app.run("api")
+        
+        elif args.standalone:
+            app = MainApplication(args.config)
+            await app.run("standalone")
+        
+        else:
+            # Default: show help and run demo
+            parser.print_help()
+            print(f"\n🎯 No mode specified. Running demo analysis...")
+            await run_example_analysis()
+            
+    except KeyboardInterrupt:
+        print(f"\n👋 Agent stopped by user")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        logging.error(f"Application error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Ensure we're using the right event loop policy on Windows
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    asyncio.run(main())
